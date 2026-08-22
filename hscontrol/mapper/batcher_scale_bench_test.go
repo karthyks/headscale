@@ -885,3 +885,238 @@ func BenchmarkScale_MapResponse_FullUpdate(b *testing.B) {
 		})
 	}
 }
+
+// ============================================================================
+// Tier 6: Real-mapper hot path at production scale — broadcast fan-out and
+// reconnect storms against a REAL mapper (DB + state + policy).
+// ============================================================================
+
+// benchDrainChannel receives until ch is empty. Used to consume initial maps
+// so they don't count against later measurements.
+func benchDrainChannel(ch chan *tailcfg.MapResponse) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
+// benchWaitAllResponses blocks until every channel has received one message,
+// or fails the benchmark after the deadline. Each node gets exactly one
+// response per broadcast iteration, so one receive per channel is the full
+// drain.
+func benchWaitAllResponses(b *testing.B, channels []chan *tailcfg.MapResponse) {
+	b.Helper()
+
+	deadline := time.Now().Add(2 * time.Minute)
+
+	for _, ch := range channels {
+		received := false
+
+		for !received {
+			select {
+			case <-ch:
+				received = true
+			default:
+				if !time.Now().Before(deadline) {
+					b.Fatalf("timed out waiting for broadcast drain")
+				}
+
+				time.Sleep(500 * time.Microsecond) //nolint:forbidigo // bench drain poll
+			}
+		}
+	}
+}
+
+// benchQuiesce waits until no node conn has pending changes or work in
+// flight, so the next benchmark iteration starts from a settled batcher.
+func benchQuiesce(b *testing.B, batcher *Batcher) {
+	b.Helper()
+
+	deadline := time.Now().Add(time.Minute)
+
+	for {
+		settled := true
+
+		batcher.nodes.Range(func(_ types.NodeID, nc *multiChannelNodeConn) bool {
+			nc.pendingMu.Lock()
+			pending := len(nc.pending)
+			nc.pendingMu.Unlock()
+
+			if pending != 0 || nc.inFlight.Load() {
+				settled = false
+
+				return false
+			}
+
+			return true
+		})
+
+		if settled {
+			return
+		}
+
+		if !time.Now().Before(deadline) {
+			b.Fatalf("timed out waiting for batcher to quiesce")
+		}
+
+		time.Sleep(500 * time.Microsecond) //nolint:forbidigo // bench settle poll
+	}
+}
+
+// BenchmarkScale_RealMapper_Broadcast1000 delivers one NodeAdded broadcast to
+// 1000 conns backed by a real mapper (DB + state + policy) and measures the
+// full drain: change fan-out, per-node visibility filtering, MapResponse
+// generation for every connected client, and channel delivery.
+//
+// Unlike the nil-mapper tiers above, this captures the dominant production
+// cost of a broadcast at scale: every receiving node runs peer-visibility
+// computation over the whole tailnet, making a single-node event cost
+// O(N^2) work server-wide.
+func BenchmarkScale_RealMapper_Broadcast1000(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping real-mapper benchmark in short mode")
+	}
+
+	// 4 users x 250 nodes = 1000 registered nodes, mirroring the
+	// BenchmarkFullPipeline setup helper at production scale.
+	testData, cleanup := setupBatcherWithTestData(b, NewBatcherAndMapper, 4, 250, largeBufferSize)
+	defer cleanup()
+
+	batcher := testData.Batcher
+	allNodes := testData.Nodes
+
+	channels := make([]chan *tailcfg.MapResponse, len(allNodes))
+
+	for i := range allNodes {
+		node := &allNodes[i]
+		ch := make(chan *tailcfg.MapResponse, largeBufferSize)
+
+		err := batcher.AddNode(node.n.ID, ch, tailcfg.CapabilityVersion(100), nil)
+		if err != nil {
+			b.Fatalf("failed to add node %d: %v", node.n.ID, err)
+		}
+
+		channels[i] = ch
+		<-ch // consume the initial map; only broadcasts are timed
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := range b.N {
+		origin := allNodes[i%len(allNodes)].n.ID
+
+		batcher.AddWork(change.NodeAdded(origin))
+		// Kick the worker pool immediately instead of waiting for the
+		// batch tick so the number covers generation+delivery rather than
+		// the tick delay.
+		batcher.processBatchedChanges()
+		benchWaitAllResponses(b, channels)
+		benchQuiesce(b, batcher.Batcher)
+	}
+
+	b.StopTimer()
+}
+
+// BenchmarkScale_ReconnectStorm simulates 64 clients reconnecting
+// concurrently against a batcher that already carries 936 live conns
+// (total 1000 registered nodes). Each AddNode generates and delivers an
+// initial full MapResponse through the shared worker pool, so the measured
+// wall time is the storm's total initial-map latency.
+func BenchmarkScale_ReconnectStorm(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping real-mapper benchmark in short mode")
+	}
+
+	const (
+		stormSize = 64
+		totalSize = 1000
+	)
+
+	// 4 users x 250 nodes = 1000 registered nodes.
+	testData, cleanup := setupBatcherWithTestData(b, NewBatcherAndMapper, 4, 250, largeBufferSize)
+	defer cleanup()
+
+	batcher := testData.Batcher
+	allNodes := testData.Nodes
+
+	if len(allNodes) != totalSize {
+		b.Fatalf("expected %d test nodes, got %d", totalSize, len(allNodes))
+	}
+
+	preCount := totalSize - stormSize
+
+	// Pre-register 936 conns and consume their initial maps.
+	for i := range preCount {
+		node := &allNodes[i]
+		ch := make(chan *tailcfg.MapResponse, largeBufferSize)
+
+		err := batcher.AddNode(node.n.ID, ch, tailcfg.CapabilityVersion(100), nil)
+		if err != nil {
+			b.Fatalf("failed to pre-register node %d: %v", node.n.ID, err)
+		}
+
+		<-ch
+	}
+
+	stormNodes := allNodes[preCount:]
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		b.StopTimer()
+
+		stormCh := make([]chan *tailcfg.MapResponse, stormSize)
+		for k := range stormCh {
+			stormCh[k] = make(chan *tailcfg.MapResponse, largeBufferSize)
+		}
+
+		b.StartTimer()
+
+		var (
+			wg      sync.WaitGroup
+			mu      sync.Mutex
+			addErrs []error
+		)
+
+		wg.Add(stormSize)
+
+		for k := range stormSize {
+			go func(k int) {
+				defer wg.Done()
+
+				err := batcher.AddNode(
+					stormNodes[k].n.ID,
+					stormCh[k],
+					tailcfg.CapabilityVersion(100),
+					nil,
+				)
+				if err != nil {
+					mu.Lock()
+					addErrs = append(addErrs, fmt.Errorf("node %d: %w", stormNodes[k].n.ID, err))
+					mu.Unlock()
+				}
+			}(k)
+		}
+
+		// AddNode returns only after the initial map was generated and sent,
+		// so wg.Wait is the "all initial maps delivered" barrier.
+		wg.Wait()
+		b.StopTimer()
+
+		if len(addErrs) > 0 {
+			b.Fatalf("%d storm adds failed, first error: %v", len(addErrs), addErrs[0])
+		}
+
+		// Tear the wave down outside the timer so the next iteration
+		// reconnects cleanly.
+		for k := range stormSize {
+			batcher.RemoveNode(stormNodes[k].n.ID, stormCh[k])
+			benchDrainChannel(stormCh[k])
+		}
+	}
+}
