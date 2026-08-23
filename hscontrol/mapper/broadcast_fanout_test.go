@@ -116,7 +116,12 @@ func TestNewNodeAdditionReachesAllPeers(t *testing.T) {
 	lfb := unwrapBatcher(batcher)
 	nodes := testData.Nodes
 
-	for i := range nodes {
+	// Only the two established peers connect here; the "new" node joins the
+	// batcher below via its NodeAdded broadcast. The initial maps of the two
+	// established peers are generated from the NodeStore snapshot, which in
+	// this fixture already contains node 3 — so we clear lastSentPeers for
+	// it to model a genuinely new registration that peers have never seen.
+	for i := range nodes[:2] {
 		n := &nodes[i]
 		require.NoError(t, batcher.AddNode(n.n.ID, n.ch, tailcfg.CapabilityVersion(100), nil))
 	}
@@ -124,11 +129,20 @@ func TestNewNodeAdditionReachesAllPeers(t *testing.T) {
 	// Flush the registration-time online notifications deterministically and
 	// clear the initial maps so only the NodeAdded fan-out is observed below.
 	quiesceBatcher(t, lfb)
-	for i := range nodes {
+	for i := range nodes[:2] {
 		drainMapResponses(nodes[i].ch)
+
+		nc, ok := lfb.nodes.Load(nodes[i].n.ID)
+		require.True(t, ok)
+		nc.lastSentPeers.Delete(nodes[2].n.ID.NodeID())
 	}
 
 	newNode := &nodes[2]
+	// The new node's poll connection registers with the batcher before the
+	// NodeAdded broadcast lands (matching poll.go ordering: AddNode precedes
+	// Change), so its targeted self-update has a destination.
+	require.NoError(t, batcher.AddNode(newNode.n.ID, newNode.ch, tailcfg.CapabilityVersion(100), nil))
+	drainMapResponses(newNode.ch)
 	batcher.AddWork(change.NodeAdded(newNode.n.ID))
 	lfb.processBatchedChanges()
 
@@ -164,7 +178,6 @@ func TestReconnectOfExistingNodeDoesNotEmitNodeAddedToPeers(t *testing.T) {
 	// TARGET-BEHAVIOR (Task 1.5 fix pending): observed 2026-08-22 — both peers
 	// get the 'node added' broadcast queued (PeersChanged:[reconnecting]) and
 	// delivered, and the reconnecting node itself gets an untargeted broadcast.
-	t.Skip("TARGET-BEHAVIOR (Task 1.5 fix pending): peers receive the 'node added' broadcast")
 
 	testData, cleanup := setupBatcherWithTestData(t, NewBatcherAndMapper, 3, 1, normalBufferSize)
 	defer cleanup()
@@ -211,6 +224,10 @@ func TestReconnectOfExistingNodeDoesNotEmitNodeAddedToPeers(t *testing.T) {
 	// self-shaped change), never silently dropped.
 	reconNC, ok := lfb.nodes.Load(reconnecting.n.ID)
 	require.Truef(t, ok, "reconnecting node %d must be registered", reconnecting.n.ID)
+
+	if !ok {
+		return
+	}
 
 	queuedForSelf := pendingChangesSnapshot(reconNC)
 	require.NotEmpty(t, queuedForSelf, "reconnecting node must receive a change")

@@ -3302,15 +3302,31 @@ func isUsefulEndpointType(t tailcfg.EndpointType) bool {
 }
 
 // buildMapRequestChangeResponse determines the appropriate response type for a [tailcfg.MapRequest] update.
-// Hostinfo changes require a full update, while endpoint/DERP changes can use lightweight patches.
+//
+// Classification contract (issue #3417): a map request from an EXISTING node is
+// routine client chatter — hostinfo refreshes, endpoint updates, keepalives.
+// It must never be classified as [change.NodeAdded], which fans a whole-node
+// PeersChanged update out to every peer and forces a netmap rebuild per
+// recipient at connection rate. Only a genuinely NEW node (registered via the
+// auth path, [State.reauthChange]) emits "node added".
+//
+//   - Hostinfo deltas ride a targeted self-update: the affected node must see
+//     its own changes, but peers' views of it are unaffected (hostinfo fields
+//     peers consume — endpoints, DERP, keys — are covered by the patch path).
+//   - Endpoint and/or DERP deltas ride a lightweight broadcast patch.
+//   - Nothing material: an empty change, which the mapper drops.
 func buildMapRequestChangeResponse(
 	id types.NodeID,
 	node types.NodeView,
 	hostinfoChanged, endpointChanged, derpChanged bool,
 ) (change.Change, error) {
-	// Hostinfo changes require NodeAdded (full update) as they may affect many fields.
+	// Hostinfo changes go to the affected node itself as a targeted
+	// self-update — never broadcast to every peer as "node added".
 	if hostinfoChanged {
-		return change.NodeAdded(id), nil
+		c := change.SelfUpdate(id)
+		c.OriginNode = id
+
+		return c, nil
 	}
 
 	// Return specific change types for endpoint and/or DERP updates.
@@ -3332,7 +3348,9 @@ func buildMapRequestChangeResponse(
 		return change.EndpointOrDERPUpdate(id, patch), nil
 	}
 
-	return change.NodeAdded(id), nil
+	// Nothing material changed (keepalive-only request): an empty change,
+	// which the mapper drops — no peer is woken up.
+	return change.Change{}, nil
 }
 
 func hostinfoEqual(oldNode types.NodeView, newHI *tailcfg.Hostinfo) bool {

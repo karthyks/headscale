@@ -114,12 +114,6 @@ func TestHostinfoChangeShouldNotBroadcastFullUpdate(t *testing.T) {
 	ch, err := buildMapRequestChangeResponse(node.ID, node.View(), true, false, false)
 	require.NoError(t, err)
 
-	t.Skip("TARGET-BEHAVIOR (Task 1.5 fix pending): " +
-		"observed failure: buildMapRequestChangeResponse(hostinfoChanged=true) " +
-		"returns change.NodeAdded(id) — Reason:\"node added\", TargetNode unset, " +
-		"PeersChanged=[id], Type=peers — so isBroadcastPeersChanged(ch)=true and " +
-		"'Should be false' fails")
-
 	// The hostinfo delta must stay lightweight: targeted at the affected
 	// node or carried as a patch, never broadcast to every peer.
 	require.Falsef(t, isBroadcastPeersChanged(ch),
@@ -139,12 +133,6 @@ func TestNoOpMapRequestProducesNoBroadcast(t *testing.T) {
 
 	ch, err := buildMapRequestChangeResponse(node.ID, node.View(), false, false, false)
 	require.NoError(t, err)
-
-	t.Skip("TARGET-BEHAVIOR (Task 1.5 fix pending): " +
-		"observed failure: buildMapRequestChangeResponse(all-false) falls through " +
-		"to the final return change.NodeAdded(id) — Reason:\"node added\", " +
-		"TargetNode unset, PeersChanged=[id], IsEmpty=false — so " +
-		"IsEmpty()||IsTargetedToNode() is false and 'Should be true' fails")
 
 	// Nothing changed, so nobody should be notified: an empty change or a
 	// targeted one at most, never a broadcast.

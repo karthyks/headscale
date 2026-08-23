@@ -445,6 +445,25 @@ func NodeAdded(id types.NodeID) Change {
 	return c
 }
 
+// IsNodeAdded reports whether r was produced by [NodeAdded]: an untargeted,
+// single-peer whole-node update whose origin is the changed node. The batcher
+// uses this to suppress the broadcast for recipients that already know the
+// node (#3417), routing it only to connections that have never seen it plus a
+// targeted self-update for the node itself.
+func (r Change) IsNodeAdded() bool {
+	return r.TargetNode == 0 &&
+		r.Reason == "node added" &&
+		r.OriginNode != 0 &&
+		len(r.PeersChanged) == 1 &&
+		r.PeersChanged[0] == r.OriginNode &&
+		len(r.PeerPatches) == 0 &&
+		len(r.PeersRemoved) == 0 &&
+		!r.SendAllPeers &&
+		!r.RequiresRuntimePeerComputation &&
+		!r.IncludeSelf && !r.IncludeDERPMap && !r.IncludeDNS &&
+		!r.IncludeDomain && !r.IncludePolicy
+}
+
 // NodeRemoved returns a [Change] for when a node is removed.
 func NodeRemoved(id types.NodeID) Change {
 	return PeersRemoved(id)

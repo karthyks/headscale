@@ -637,6 +637,51 @@ func (b *Batcher) addToBatch(changes ...change.Change) {
 
 	broadcast, targeted := change.SplitTargetedAndBroadcast(changes)
 
+	// Suppress "node added" broadcasts for nodes recipients already know
+	// (issue #3417): a map-request refresh of an EXISTING node used to fan a
+	// whole-node PeersChanged update to every connected peer, forcing a
+	// netmap rebuild per recipient at connection rate. A recipient's
+	// [multiChannelNodeConn.lastSentPeers] records exactly the peers it has
+	// been told about, so a "node added" whose origin is in that set is
+	// dropped for it; connections that have never seen the node still get
+	// the full update. The changed node itself always receives its own
+	// targeted self-update so it is never silently dropped.
+	var stillBroadcast []change.Change
+
+	for _, ch := range broadcast {
+		if !ch.IsNodeAdded() {
+			stillBroadcast = append(stillBroadcast, ch)
+
+			continue
+		}
+
+		origin := ch.OriginNode
+
+		self := change.SelfUpdate(origin)
+
+		targeted = append(targeted, self)
+
+		b.nodes.Range(func(nodeID types.NodeID, nc *multiChannelNodeConn) bool {
+			if nc == nil || nodeID == origin {
+				return true
+			}
+
+			if _, known := nc.lastSentPeers.Load(tailcfg.NodeID(origin)); known {
+				log.Debug().
+					Uint64(zf.NodeID, origin.Uint64()).
+					Msg("suppressing 'node added' broadcast for already-known node")
+
+				return true
+			}
+
+			nc.appendPending(ch)
+
+			return true
+		})
+	}
+
+	broadcast = stillBroadcast
+
 	// Handle targeted changes - send only to the specific node
 	for _, ch := range targeted {
 		if nc, ok := b.nodes.Load(ch.TargetNode); ok && nc != nil {

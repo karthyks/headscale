@@ -1043,7 +1043,10 @@ func TestBatcherWorkQueueBatching(t *testing.T) {
 			testExpiry := time.Now().Add(24 * time.Hour)
 			batcher.AddWork(change.KeyExpiryFor(testNodes[1].n.ID, testExpiry))
 			batcher.AddWork(change.DERPMap())
-			batcher.AddWork(change.NodeAdded(testNodes[1].n.ID))
+			// NodeAdded for an existing node is suppressed as a broadcast by the
+			// #3417 fix (node 1 already has node 2 in lastSentPeers), so use a
+			// KeyExpiry change to keep the expected update count stable.
+			batcher.AddWork(change.KeyExpiryFor(testNodes[1].n.ID, testExpiry))
 			batcher.AddWork(change.DERPMap())
 
 			// Collect updates with timeout
