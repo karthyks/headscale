@@ -3223,11 +3223,25 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 	policyChange := change.Change{}
 
 	if persistWorthy {
+		// Persist the row and check the policy manager directly rather than
+		// via [State.persistNodeToDB]: that helper substitutes
+		// [change.NodeAdded] when the policy manager reports no change, which
+		// would hijack every persist-worthy map-request delta into a
+		// whole-node broadcast. The batcher suppresses such broadcasts for
+		// recipients that already know the node (#3417), silently dropping
+		// the endpoint/DERP information peers still need (the regression
+		// behind TestPingAllByIP's "does not have a DERP"). Classification of
+		// the delta is [buildMapRequestChangeResponse]'s job below; a genuine
+		// policy change is still honoured by the IsEmpty check underneath.
+		if _, err := s.persistNodeRowToDB(updatedNode); err != nil {
+			return change.Change{}, fmt.Errorf("saving to database: %w", err)
+		}
+
 		var err error
 
-		_, policyChange, err = s.persistNodeToDB(updatedNode)
+		policyChange, err = s.updatePolicyManagerNodes()
 		if err != nil {
-			return change.Change{}, fmt.Errorf("saving to database: %w", err)
+			return change.Change{}, fmt.Errorf("updating policy manager after node save: %w", err)
 		}
 	}
 
@@ -3310,42 +3324,40 @@ func isUsefulEndpointType(t tailcfg.EndpointType) bool {
 // recipient at connection rate. Only a genuinely NEW node (registered via the
 // auth path, [State.reauthChange]) emits "node added".
 //
-//   - Hostinfo deltas ride a targeted self-update: the affected node must see
-//     its own changes, but peers' views of it are unaffected (hostinfo fields
-//     peers consume — endpoints, DERP, keys — are covered by the patch path).
-//   - Endpoint and/or DERP deltas ride a lightweight broadcast patch.
+//   - Hostinfo-only deltas ride a targeted self-update: the affected node must
+//     see its own changes, but peers' views of it are unaffected (hostinfo
+//     fields peers consume — endpoints, DERP, keys — are covered by the patch
+//     path).
+//   - Endpoint and/or DERP deltas ride a lightweight broadcast patch, whether
+//     or not the request also refreshed hostinfo. The patch must win the
+//     combined case: a targeted self-update reaches only the requesting node,
+//     so classifying hostinfo+DERP as one would drop the DERP/endpoint
+//     broadcast and peers would never learn the peer's relay (#3417 follow-up
+//     regression). The origin node still sees its own hostinfo changes because
+//     the mapper routes any change with [Change.OriginNode] set back to the
+//     origin as a self-update.
 //   - Nothing material: an empty change, which the mapper drops.
 func buildMapRequestChangeResponse(
 	id types.NodeID,
 	node types.NodeView,
 	hostinfoChanged, endpointChanged, derpChanged bool,
 ) (change.Change, error) {
-	// Hostinfo changes go to the affected node itself as a targeted
-	// self-update — never broadcast to every peer as "node added".
-	if hostinfoChanged {
-		c := change.SelfUpdate(id)
-		c.OriginNode = id
-
-		return c, nil
-	}
-
-	// Return specific change types for endpoint and/or DERP updates.
+	// Return a single-peer whole-node update for endpoint and/or DERP
+	// changes. This must take precedence over the hostinfo-only self-update:
+	// the update is what carries the new endpoints / DERP region to peers.
+	//
+	// A [tailcfg.PeerChange] patch is not sufficient here: clients apply
+	// patch.DERPRegion to their ipnstate view, but peers whose wgcfg was
+	// already built with "doesn't offer DERP" keep excluding the node from
+	// their WireGuard configuration — the patch never triggers the reconfig
+	// needed to attach it to a relay (observed as TestPingAllByIP's "does
+	// not have a DERP"). A single-peer PeersChanged entry is authoritative
+	// peer state, so every client rebuilds that peer correctly, while still
+	// avoiding the #3417 fan-out: only this one node is advertised, never a
+	// whole-tailnet rebuild, and existing nodes are still never classified
+	// as NodeAdded.
 	if endpointChanged || derpChanged {
-		patch := &tailcfg.PeerChange{NodeID: id.NodeID()}
-
-		if endpointChanged {
-			patch.Endpoints = node.Endpoints().AsSlice()
-		}
-
-		if derpChanged {
-			if hi := node.Hostinfo(); hi.Valid() {
-				if ni := hi.NetInfo(); ni.Valid() {
-					patch.DERPRegion = ni.PreferredDERP()
-				}
-			}
-		}
-
-		return change.EndpointOrDERPUpdate(id, patch), nil
+		return change.PeersChanged("endpoint/DERP update", id), nil
 	}
 
 	// Nothing material changed (keepalive-only request): an empty change,
