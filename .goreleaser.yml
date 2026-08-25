@@ -95,8 +95,7 @@ nfpms:
 kos:
   - id: ghcr
     repositories:
-      - ghcr.io/juanfont/headscale
-      - headscale/headscale
+      - ghcr.io/karthyks/headscale
 
     # bare tells KO to only use the repository
     # for tagging and naming the container.
@@ -126,8 +125,7 @@ kos:
 
   - id: ghcr-debug
     repositories:
-      - ghcr.io/juanfont/headscale
-      - headscale/headscale
+      - ghcr.io/karthyks/headscale
 
     bare: true
     base_image: gcr.io/distroless/base-debian13:debug
